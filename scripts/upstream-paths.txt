@@ -7,6 +7,14 @@
 # sync script therefore refuses to advance `upstream` when that happens.
 #
 # Add a path only together with a deliberate, documented re-import.
+#
+# Re-import 2026-11-09: added crates/bench_metrics, crates/gpui_apple and
+# crates/gpui_ios (upstream moved the Metal renderer into gpui_apple, zed
+# #62649). None existed before this fork's `main` base, so every commit up to it
+# kept its SHA; the old `upstream` branch diverges at #62649 and is frozen, and
+# the filtered history now lives on `zed-upstream`. A path that upstream adds
+# AFTER a sync point is safe to add the same way; check with
+# `git merge-base --is-ancestor <main base> <new filtered tip>`.
 
 Cargo.toml
 LICENSE-APACHE
@@ -14,8 +22,11 @@ LICENSE-GPL
 assets/fonts
 tooling/perf
 
+crates/bench_metrics
 crates/collections
 crates/gpui
+crates/gpui_apple
+crates/gpui_ios
 crates/gpui_linux
 crates/gpui_macos
 crates/gpui_macros

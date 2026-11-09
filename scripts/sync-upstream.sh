@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Re-derive this fork's filtered upstream history from zed-industries/zed and
-# advance the local `upstream` branch to it.
+# advance the local `zed-upstream` branch ($SYNC_BRANCH) to it.
 #
 # This fork is a PATH-FILTERED extraction of the Zed monorepo (the crates listed
 # in scripts/upstream-paths.txt), not a whole-repo fork, so "sync" is not a plain
@@ -40,6 +40,11 @@ set -euo pipefail
 
 UPSTREAM_URL=${UPSTREAM_URL:-https://github.com/zed-industries/zed}
 UPSTREAM_BRANCH=${UPSTREAM_BRANCH:-main}
+# The fork branch holding the filtered history. `zed-upstream` since the
+# 2026-11-09 re-extraction (gpui_apple/gpui_ios/bench_metrics added to the path
+# list); the old `upstream` branch is frozen — it diverges from this one at the
+# commit that created crates/gpui_apple, which it could not see.
+SYNC_BRANCH=${SYNC_BRANCH:-zed-upstream}
 MERGE=0
 [ "${1:-}" = "--merge" ] && MERGE=1
 
@@ -79,8 +84,8 @@ drop_candidate() { git -C "$ROOT" update-ref -d refs/upstream-sync/candidate || 
 # A fresh clone has no local `upstream` branch, only origin's. Fall back to it,
 # or the ancestry check below would be skipped on exactly the checkout most
 # likely to be running this for the first time.
-OLD=$(git -C "$ROOT" rev-parse --verify -q refs/heads/upstream \
-   || git -C "$ROOT" rev-parse --verify -q refs/remotes/origin/upstream || true)
+OLD=$(git -C "$ROOT" rev-parse --verify -q "refs/heads/$SYNC_BRANCH" \
+   || git -C "$ROOT" rev-parse --verify -q "refs/remotes/origin/$SYNC_BRANCH" || true)
 if [ -n "$OLD" ]; then
   if [ "$OLD" = "$NEW" ]; then
     echo "==> already up to date ($OLD)"
@@ -89,27 +94,27 @@ if [ -n "$OLD" ]; then
   fi
   if ! git -C "$ROOT" merge-base --is-ancestor "$OLD" "$NEW"; then
     drop_candidate
-    die "re-derived history does NOT contain the published \`upstream\` tip $OLD.
+    die "re-derived history does NOT contain the published \`$SYNC_BRANCH\` tip $OLD.
        Advancing would replace every commit with a differently-hashed twin and
        nothing already pinned would merge. Something in the extraction changed:
        scripts/upstream-paths.txt, the git-filter-repo version, or upstream's
-       own history. Investigate before touching \`upstream\`."
+       own history. Investigate before touching \`$SYNC_BRANCH\`."
   fi
   echo "==> $(git -C "$ROOT" rev-list --count "$OLD..$NEW") new upstream commits since $OLD"
 else
-  echo "==> creating \`upstream\` at $NEW"
+  echo "==> creating \`$SYNC_BRANCH\` at $NEW"
 fi
 
-git -C "$ROOT" update-ref refs/heads/upstream "$NEW"
+git -C "$ROOT" update-ref "refs/heads/$SYNC_BRANCH" "$NEW"
 drop_candidate
-echo "==> upstream -> $NEW  (upstream/zed $UPSTREAM_TIP)"
+echo "==> $SYNC_BRANCH -> $NEW  (upstream/zed $UPSTREAM_TIP)"
 
 if [ "$MERGE" = "0" ]; then
   cat <<EOF
 
 Next: merge it into your branch and re-prune the manifest.
 
-    git merge upstream
+    git merge $SYNC_BRANCH
     # on a Cargo.toml conflict, take upstream's members list, then:
     python3 scripts/prune-workspace.py && git add Cargo.toml && git commit
 
@@ -118,8 +123,8 @@ EOF
 fi
 
 BRANCH=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)
-echo "==> merging \`upstream\` into $BRANCH"
-if git -C "$ROOT" merge --no-edit upstream; then
+echo "==> merging \`$SYNC_BRANCH\` into $BRANCH"
+if git -C "$ROOT" merge --no-edit "$SYNC_BRANCH"; then
   python3 "$ROOT/scripts/prune-workspace.py" --check >/dev/null \
     || die "merge succeeded but Cargo.toml is no longer pruned — run
        python3 scripts/prune-workspace.py, then amend the merge commit."
@@ -137,7 +142,7 @@ fi
 REMAINING=$(git -C "$ROOT" diff --name-only --diff-filter=U)
 if [ -n "$REMAINING" ]; then
   echo
-  echo "Conflicts left for you (the MGVS patch vs upstream's changes):"
+  echo "Conflicts left for you (the fork patch vs upstream's changes):"
   echo "$REMAINING" | sed 's/^/    /'
   echo
   echo "Resolve, then: git commit"
