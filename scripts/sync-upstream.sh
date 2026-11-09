@@ -142,7 +142,7 @@ fi
 REMAINING=$(git -C "$ROOT" diff --name-only --diff-filter=U)
 if [ -n "$REMAINING" ]; then
   echo
-  echo "Conflicts left for you (the MGVS patch vs upstream's changes):"
+  echo "Conflicts left for you (the fork patch vs upstream's changes):"
   echo "$REMAINING" | sed 's/^/    /'
   echo
   echo "Resolve, then: git commit"

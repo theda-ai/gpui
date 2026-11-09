@@ -102,7 +102,12 @@ git checkout main && git merge zed-upstream
 or `scripts/sync-upstream.sh --merge` to do both, which also re-prunes
 `Cargo.toml` for you. Expect the merge to conflict only where upstream touched
 `crates/gpui_apple/src/metal_renderer.rs` or `shaders.metal` — the two files the
-patch owns. After a merge, check that the workspace still loads
+patch owns. When upstream moves one of those files, git's rename detection can
+carry the fork's hunks into the new location silently, with no conflict (the
+2026-11-09 merge put a second `surface_fragment_rgba` into
+`gpui_apple/src/shaders.metal` that way), so after a merge grep the moved files
+for the patch before re-applying it, and run the `gpui_apple` tests on macOS.
+After a merge, also check that the workspace still loads
 (`cargo metadata --no-deps`): upstream gpui gaining a dependency on a crate this
 fork does not carry shows up there, and the fix is a documented addition to
 `scripts/upstream-paths.txt` (see the note at its top).
