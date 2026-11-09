@@ -11,7 +11,9 @@ This script rewrites, in place:
   * `members`        — dropped down to the entries whose directory really exists,
                        in upstream's order;
   * `default-members`— pinned to `["crates/gpui"]`, so a bare `cargo build` in a
-                       checkout of this fork builds gpui rather than the editor.
+                       checkout of this fork builds gpui rather than the editor;
+  * `[patch.*]`      — entries whose `path` this fork does not carry are dropped
+                       (with their comment block), since Cargo loads every patch.
 
 Everything else, `[workspace.dependencies]` included, is left exactly as upstream
 wrote it: unused workspace dependencies are inert (Cargo resolves a workspace
@@ -36,7 +38,16 @@ import sys
 
 DEFAULT_MEMBERS = ["crates/gpui"]
 
+# Directories the history still carries (dropping a path from
+# scripts/upstream-paths.txt would re-hash every commit) but that are no longer
+# workspace members. `crates/util`: nothing gpui needs depends on it any more
+# (http_client lost its `github-download` feature upstream), and upstream's
+# `util` now depends on `crates/path`, which this fork does not carry, so as a
+# member it would stop the workspace manifest from loading.
+EXCLUDED_MEMBERS = {"crates/util"}
+
 MEMBER_RE = re.compile(r'^\s*"([^"]+)"\s*,?\s*$')
+PATCH_PATH_RE = re.compile(r'^[\w-]+\s*=\s*\{[^}]*\bpath\s*=\s*"([^"]+)"[^}]*\}\s*$')
 
 
 def prune(text: str, root: pathlib.Path) -> str:
@@ -45,6 +56,7 @@ def prune(text: str, root: pathlib.Path) -> str:
     i = 0
     seen_members = False
     seen_default = False
+    in_patch = False
 
     while i < len(lines):
         line = lines[i]
@@ -59,7 +71,11 @@ def prune(text: str, root: pathlib.Path) -> str:
                 # Comment and blank lines inside the array are upstream's section
                 # headers ("# Extensions", "# Tooling"); they describe crates this
                 # fork does not carry, so they go with them.
-                if m and (root / m.group(1) / "Cargo.toml").is_file():
+                if (
+                    m
+                    and m.group(1) not in EXCLUDED_MEMBERS
+                    and (root / m.group(1) / "Cargo.toml").is_file()
+                ):
                     kept.append(f'    "{m.group(1)}",\n')
                 i += 1
             out.extend(kept)
@@ -75,6 +91,21 @@ def prune(text: str, root: pathlib.Path) -> str:
             if "]" not in line:
                 while i < len(lines) and "]" not in lines[i]:
                     i += 1
+            i += 1
+            continue
+
+        if re.match(r"^\[", line):
+            in_patch = bool(re.match(r"^\[patch\.", line))
+
+        # A `[patch.*]` entry that redirects to a path this fork does not carry
+        # (upstream's `tooling/corgi/patches/scratch`) is not inert like an
+        # unused workspace dependency: Cargo loads every patch source when it
+        # resolves, so it fails the whole workspace. Drop it together with the
+        # comment block directly above it, which explains only that entry.
+        m = PATCH_PATH_RE.match(line)
+        if in_patch and m and not (root / m.group(1) / "Cargo.toml").is_file():
+            while out and out[-1].lstrip().startswith("#"):
+                out.pop()
             i += 1
             continue
 
