@@ -13,7 +13,8 @@ use objc2_core_graphics::{CGColorSpace, kCGColorSpaceDisplayP3};
 use objc2_core_video::{
     CVMetalTexture, CVMetalTextureCache, CVMetalTextureGetTexture, CVPixelBufferGetHeight,
     CVPixelBufferGetHeightOfPlane, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
-    CVPixelBufferGetWidthOfPlane, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVReturnSuccess,
+    CVPixelBufferGetWidthOfPlane, kCVPixelFormatType_32BGRA,
+    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVReturnSuccess,
 };
 use objc2_foundation::{NSRange, NSString};
 #[cfg(target_os = "macos")]
@@ -143,6 +144,10 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     polychrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     surfaces_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    /// Bound to `surface_fragment_rgba`: samples a single-plane `BGRA8Unorm`
+    /// surface texture directly (no YCbCr matrix). `draw_surfaces` selects it
+    /// when the surface's `CVPixelBuffer` is `32BGRA`.
+    surfaces_rgba_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
@@ -393,6 +398,17 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         )?;
+        // Sibling of `surfaces_pipeline_state` for single-plane 32BGRA surfaces:
+        // same vertex stage, target format and blend setup, RGBA passthrough
+        // fragment shader.
+        let surfaces_rgba_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "surfaces_rgba",
+            "surface_vertex",
+            "surface_fragment_rgba",
+            MTLPixelFormat::BGRA8Unorm,
+        )?;
 
         let command_queue = device.newCommandQueue().context("creating command queue")?;
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
@@ -431,6 +447,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            surfaces_rgba_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -1380,7 +1397,7 @@ impl MetalRenderer {
             return Ok(());
         }
 
-        command_encoder.setRenderPipelineState(&self.surfaces_pipeline_state);
+        // The pipeline state is set per surface below, by pixel format.
         // SAFETY: The unit vertices, SurfaceBounds instances, and copied viewport match the shader layouts and slots.
         // Metal retains the buffers, and writer.finish publishes CPU writes before submission.
         unsafe {
@@ -1408,64 +1425,109 @@ impl MetalRenderer {
                 DevicePixels::from(CVPixelBufferGetHeight(image_buffer) as i32),
             );
 
+            // The pipeline is chosen per surface from its pixel format: biplanar
+            // NV12 (video, screen capture) goes through the YCbCr matrix in
+            // `surface_fragment`; single-plane 32BGRA (a frame a host already
+            // rendered into an IOSurface) is sampled as-is by
+            // `surface_fragment_rgba`. Both share `surface_vertex` and its bindings.
             let pixel_format = CVPixelBufferGetPixelFormatType(image_buffer);
             anyhow::ensure!(
-                pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                    || pixel_format == kCVPixelFormatType_32BGRA,
                 "unsupported surface pixel format: {pixel_format:#x}"
             );
 
-            let plane_texture = |plane, format| -> Result<CFRetained<CVMetalTexture>> {
-                let width = CVPixelBufferGetWidthOfPlane(image_buffer, plane);
-                let height = CVPixelBufferGetHeightOfPlane(image_buffer, plane);
-                let mut texture = ptr::null_mut();
-                // SAFETY: The buffer has two planes matching these formats and dimensions, and the output pointer is writable.
-                let status = unsafe {
-                    CVMetalTextureCache::create_texture_from_image(
-                        None,
-                        &self.core_video_texture_cache,
-                        image_buffer,
-                        None,
-                        format,
-                        width,
-                        height,
+            let create_texture =
+                |plane, format, width, height| -> Result<CFRetained<CVMetalTexture>> {
+                    let mut texture = ptr::null_mut();
+                    // SAFETY: The plane index, format and dimensions describe a plane of this buffer, and the output pointer is writable.
+                    let status = unsafe {
+                        CVMetalTextureCache::create_texture_from_image(
+                            None,
+                            &self.core_video_texture_cache,
+                            image_buffer,
+                            None,
+                            format,
+                            width,
+                            height,
+                            plane,
+                            ptr::NonNull::from(&mut texture),
+                        )
+                    };
+                    anyhow::ensure!(
+                        status == kCVReturnSuccess,
+                        "creating CoreVideo Metal texture for plane {plane}: status {status}"
+                    );
+                    let texture =
+                        ptr::NonNull::new(texture).context("retrieving CoreVideo Metal texture")?;
+                    // SAFETY: The successful create call transfers ownership of this non-null texture.
+                    Ok(unsafe { CFRetained::from_raw(texture) })
+                };
+
+            if pixel_format == kCVPixelFormatType_32BGRA {
+                // One BGRA8Unorm view over the whole (non-planar) buffer, bound at
+                // the slot the luma plane uses. Metal applies the BGRA->RGBA
+                // swizzle at sample time from the texture's pixel format, as the
+                // polychrome sprite pass relies on, so the shader does no reorder.
+                let color_texture = create_texture(
+                    0,
+                    MTLPixelFormat::BGRA8Unorm,
+                    CVPixelBufferGetWidth(image_buffer),
+                    CVPixelBufferGetHeight(image_buffer),
+                )?;
+                let color_metal_texture = CVMetalTextureGetTexture(&color_texture)
+                    .context("retrieving BGRA surface Metal texture")?;
+                command_encoder.setRenderPipelineState(&self.surfaces_rgba_pipeline_state);
+                // SAFETY: The size is copied from a live value, and the texture matches the shader's texture slot.
+                // The frame completion handler retains the CoreVideo wrapper until GPU reads finish.
+                unsafe {
+                    command_encoder.setVertexBytes_length_atIndex(
+                        ptr::NonNull::from(&texture_size).cast(),
+                        mem::size_of_val(&texture_size),
+                        SurfaceInputIndex::TextureSize as usize,
+                    );
+                    command_encoder.setFragmentTexture_atIndex(
+                        Some(&color_metal_texture),
+                        SurfaceInputIndex::YTexture as usize,
+                    );
+                }
+                surface_textures.push(color_texture);
+            } else {
+                let plane_texture = |plane, format| {
+                    create_texture(
                         plane,
-                        ptr::NonNull::from(&mut texture),
+                        format,
+                        CVPixelBufferGetWidthOfPlane(image_buffer, plane),
+                        CVPixelBufferGetHeightOfPlane(image_buffer, plane),
                     )
                 };
-                anyhow::ensure!(
-                    status == kCVReturnSuccess,
-                    "creating CoreVideo Metal texture for plane {plane}: status {status}"
-                );
-                let texture =
-                    ptr::NonNull::new(texture).context("retrieving CoreVideo Metal texture")?;
-                // SAFETY: The successful create call transfers ownership of this non-null texture.
-                Ok(unsafe { CFRetained::from_raw(texture) })
-            };
-            let y_texture = plane_texture(0, MTLPixelFormat::R8Unorm)?;
-            let cb_cr_texture = plane_texture(1, MTLPixelFormat::RG8Unorm)?;
-            let y_metal_texture =
-                CVMetalTextureGetTexture(&y_texture).context("retrieving luma Metal texture")?;
-            let cb_cr_metal_texture = CVMetalTextureGetTexture(&cb_cr_texture)
-                .context("retrieving chroma Metal texture")?;
+                let y_texture = plane_texture(0, MTLPixelFormat::R8Unorm)?;
+                let cb_cr_texture = plane_texture(1, MTLPixelFormat::RG8Unorm)?;
+                let y_metal_texture = CVMetalTextureGetTexture(&y_texture)
+                    .context("retrieving luma Metal texture")?;
+                let cb_cr_metal_texture = CVMetalTextureGetTexture(&cb_cr_texture)
+                    .context("retrieving chroma Metal texture")?;
 
-            // SAFETY: The size is copied from a live value, and both planes match their shader texture slots.
-            // The frame completion handler retains the CoreVideo wrappers until GPU reads finish.
-            unsafe {
-                command_encoder.setVertexBytes_length_atIndex(
-                    ptr::NonNull::from(&texture_size).cast(),
-                    mem::size_of_val(&texture_size),
-                    SurfaceInputIndex::TextureSize as usize,
-                );
-                command_encoder.setFragmentTexture_atIndex(
-                    Some(&y_metal_texture),
-                    SurfaceInputIndex::YTexture as usize,
-                );
-                command_encoder.setFragmentTexture_atIndex(
-                    Some(&cb_cr_metal_texture),
-                    SurfaceInputIndex::CbCrTexture as usize,
-                );
+                command_encoder.setRenderPipelineState(&self.surfaces_pipeline_state);
+                // SAFETY: The size is copied from a live value, and both planes match their shader texture slots.
+                // The frame completion handler retains the CoreVideo wrappers until GPU reads finish.
+                unsafe {
+                    command_encoder.setVertexBytes_length_atIndex(
+                        ptr::NonNull::from(&texture_size).cast(),
+                        mem::size_of_val(&texture_size),
+                        SurfaceInputIndex::TextureSize as usize,
+                    );
+                    command_encoder.setFragmentTexture_atIndex(
+                        Some(&y_metal_texture),
+                        SurfaceInputIndex::YTexture as usize,
+                    );
+                    command_encoder.setFragmentTexture_atIndex(
+                        Some(&cb_cr_metal_texture),
+                        SurfaceInputIndex::CbCrTexture as usize,
+                    );
+                }
+                surface_textures.extend([y_texture, cb_cr_texture]);
             }
-            surface_textures.extend([y_texture, cb_cr_texture]);
 
             // SAFETY: Six unit vertices draw one instance within the uploaded scene's surface range.
             unsafe {
@@ -1923,9 +1985,10 @@ mod tests {
     use super::*;
     use objc2_core_foundation::{CFDictionary, CFType};
     use objc2_core_video::{
-        CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane,
-        CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
-        CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey,
+        CVPixelBufferCreate, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
+        CVPixelBufferGetBytesPerRow, CVPixelBufferGetBytesPerRowOfPlane,
+        CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+        kCVPixelBufferIOSurfacePropertiesKey,
     };
     use objc2_metal::MTLCommandBufferStatus;
 
@@ -2140,5 +2203,79 @@ mod tests {
         command_buffer.waitUntilCompleted();
         assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
         assert_eq!(read_texture_to_image(&target_texture).unwrap(), image);
+    }
+
+    /// A single-plane 32BGRA surface is presented as-is. The three channels get
+    /// distinct values so a missing or doubled BGRA->RGBA swizzle shows up as
+    /// swapped red and blue, which a gray fill would hide.
+    #[test]
+    fn render_bgra_core_video_surface() {
+        let surface_properties_key = unsafe { kCVPixelBufferIOSurfacePropertiesKey };
+        let attributes = CFDictionary::from_slices(
+            &[surface_properties_key],
+            &[&*CFDictionary::<CFType, CFType>::empty()],
+        );
+        let mut image_buffer = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                CVPixelBufferCreate(
+                    None,
+                    16,
+                    16,
+                    kCVPixelFormatType_32BGRA,
+                    Some(attributes.as_opaque()),
+                    ptr::NonNull::from(&mut image_buffer),
+                )
+            },
+            kCVReturnSuccess
+        );
+        let image_buffer = ptr::NonNull::new(image_buffer).unwrap();
+        let image_buffer = unsafe { CFRetained::from_raw(image_buffer) };
+        // Memory order of 32BGRA: blue, green, red, alpha.
+        let (blue, green, red) = (200u8, 100u8, 40u8);
+        unsafe {
+            assert_eq!(
+                CVPixelBufferLockBaseAddress(&image_buffer, CVPixelBufferLockFlags::empty()),
+                kCVReturnSuccess
+            );
+            let bytes = CVPixelBufferGetBaseAddress(&image_buffer).cast::<u8>();
+            let bytes_per_row = CVPixelBufferGetBytesPerRow(&image_buffer);
+            let rows = slice::from_raw_parts_mut(bytes, bytes_per_row * 16);
+            for row in rows.chunks_mut(bytes_per_row) {
+                for pixel in row[..16 * 4].chunks_mut(4) {
+                    pixel.copy_from_slice(&[blue, green, red, 255]);
+                }
+            }
+            assert_eq!(
+                CVPixelBufferUnlockBaseAddress(&image_buffer, CVPixelBufferLockFlags::empty()),
+                kCVReturnSuccess
+            );
+        }
+
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: size(ScaledPixels(16.0), ScaledPixels(16.0)),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            image_buffer,
+        });
+        scene.finish();
+
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())))
+                .unwrap();
+        let image = renderer
+            .render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)))
+            .unwrap();
+        for image::Rgba([r, g, b, a]) in image.pixels() {
+            assert!(r.abs_diff(red) <= 1, "red {r}, expected {red}");
+            assert!(g.abs_diff(green) <= 1, "green {g}, expected {green}");
+            assert!(b.abs_diff(blue) <= 1, "blue {b}, expected {blue}");
+            assert_eq!(*a, 255);
+        }
     }
 }

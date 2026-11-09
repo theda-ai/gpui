@@ -899,6 +899,18 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
   return ycbcrToRGBTransform * ycbcr;
 }
 
+// RGBA passthrough sibling of `surface_fragment` for single-plane 32BGRA
+// surfaces. Shares `surface_vertex`; samples the texture bound at the YTexture
+// slot and returns it. The texture is a `BGRA8Unorm` view over an IOSurface, so
+// Metal applies the BGRA->RGBA swizzle at sample time from its pixel format, as
+// the polychrome sprite pass relies on; no manual reorder is needed.
+fragment float4 surface_fragment_rgba(
+    SurfaceFragmentInput input [[stage_in]],
+    texture2d<float> color_texture [[texture(SurfaceInputIndex_YTexture)]]) {
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  return color_texture.sample(texture_sampler, input.texture_position);
+}
+
 // NeoCAD E-nativetex (design §2.4): RGBA passthrough sibling of
 // `surface_fragment`. Shares `surface_vertex`; samples a single-plane surface
 // texture bound at the YTexture slot and returns it directly. The texture is a
